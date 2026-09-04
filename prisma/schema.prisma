@@ -1,0 +1,416 @@
+// Pekoni — data model
+//
+// The default provider is SQLite so the project runs with zero configuration.
+// The schema deliberately avoids provider-specific features (native enums, Json
+// columns) so switching to PostgreSQL is a one-line change:
+//
+//   provider = "postgresql"
+//
+// followed by `npm run db:migrate`. Enum-like columns are stored as String and
+// are constrained in TypeScript (see src/lib/enums.ts).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+model User {
+  id                String   @id @default(cuid())
+  username          String   @unique
+  usernameLower     String   @unique
+  email             String?  @unique
+  passwordHash      String
+  role              String   @default("USER") // USER | MODERATOR | ADMIN | OWNER
+  status            String   @default("ACTIVE") // ACTIVE | SUSPENDED
+
+  minecraftUsername String?
+  minecraftUuid     String?
+
+  level             Int      @default(1)
+  xp                Int      @default(0)
+
+  // Provably-fair seeds. serverSeed is never exposed until rotated.
+  serverSeed        String
+  serverSeedHash    String
+  clientSeed        String
+  nonce             Int      @default(0)
+
+  soundEnabled      Boolean  @default(false)
+  reducedMotion     Boolean  @default(false)
+  publicActivity    Boolean  @default(true)
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  lastSeenAt        DateTime @default(now())
+
+  wallet            Wallet?
+  sessions          Session[]
+  transactions      Transaction[]
+  gameRounds        GameRound[]
+  gameSessions      GameSession[]
+  caseOpenings      CaseOpening[]
+  battleEntries     BattleParticipant[]
+  dailyRewards      DailyReward[]
+  achievements      UserAchievement[]
+  notifications     Notification[]
+  activity          ActivityEvent[]
+  auditLogs         AdminAuditLog[]     @relation("AuditActor")
+  auditTargets      AdminAuditLog[]     @relation("AuditTarget")
+  battlesCreated    CaseBattle[]        @relation("BattleCreator")
+  stats             UserStats?
+
+  @@index([role])
+  @@index([status])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userAgent String?
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// Denormalised counters. Every write goes through the same transaction that
+// writes the ledger entry, so these can never drift from the ledger.
+model UserStats {
+  userId            String   @id
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  gamesPlayed       Int      @default(0)
+  totalWagered      Int      @default(0)
+  totalWon          Int      @default(0)
+  biggestWin        Int      @default(0)
+  winStreak         Int      @default(0)
+  bestWinStreak     Int      @default(0)
+  highestCrash      Float    @default(0)
+  bestMinesMult     Float    @default(0)
+  casesOpened       Int      @default(0)
+  battlesPlayed     Int      @default(0)
+  battlesWon        Int      @default(0)
+  mobsDefeated      Int      @default(0)
+  bestCombo         Int      @default(0)
+  updatedAt         DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Economy
+// ---------------------------------------------------------------------------
+
+model Wallet {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance   Int      @default(0)
+  version   Int      @default(0) // optimistic lock guard
+  updatedAt DateTime @updatedAt
+}
+
+model Transaction {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type          String   // see src/lib/enums.ts TransactionType
+  amount        Int      // signed: negative = debit
+  balanceBefore Int
+  balanceAfter  Int
+  source        String
+  gameId        String?
+  metadata      String? // JSON string
+  createdAt     DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([type])
+}
+
+// Guards against double-spend on retried/replayed requests.
+model IdempotencyKey {
+  key       String   @id
+  userId    String
+  scope     String
+  result    String? // JSON string of the original response
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Games
+// ---------------------------------------------------------------------------
+
+model GameRound {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  game        String   // dice | crash | mines | slots | mobgrinder | lasthope
+  bet         Int
+  payout      Int
+  multiplier  Float    @default(0)
+  outcome     String   // WIN | LOSS | PUSH
+  serverSeed  String
+  clientSeed  String
+  nonce       Int
+  result      String   // JSON string
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([game, createdAt])
+}
+
+// Multi-step games (mines, crash, last hope, mob grinder) keep authoritative
+// state server-side between requests. The client never learns the outcome early.
+model GameSession {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  game       String
+  status     String   @default("ACTIVE") // ACTIVE | CASHED_OUT | BUSTED | EXPIRED
+  bet        Int
+  state      String   // JSON string — server-only truth
+  serverSeed String
+  clientSeed String
+  nonce      Int
+  payout     Int      @default(0)
+  multiplier Float    @default(0)
+  startedAt  DateTime @default(now())
+  endedAt    DateTime?
+  expiresAt  DateTime
+
+  @@index([userId, game, status])
+}
+
+// ---------------------------------------------------------------------------
+// Cases
+// ---------------------------------------------------------------------------
+
+model Case {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  tagline     String
+  description String
+  price       Int
+  theme       String   // drives the artwork variant
+  kind        String   @default("STANDARD") // STANDARD | DAILY
+  sortOrder   Int      @default(0)
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  items       CaseItem[]
+  openings    CaseOpening[]
+  battles     CaseBattle[]
+}
+
+model CaseItem {
+  id        String  @id @default(cuid())
+  caseId    String
+  case      Case    @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  name      String
+  rarity    String  // COMMON | UNCOMMON | RARE | EPIC | LEGENDARY | MYTHIC
+  icon      String  // symbolic icon key, rendered as original vector art
+  value     Int     // coin value
+  weight    Int     // relative probability weight
+  createdAt DateTime @default(now())
+
+  openings  CaseOpening[]
+  battleRounds BattleRound[]
+
+  @@index([caseId])
+}
+
+model CaseOpening {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  caseId    String
+  case      Case     @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  itemId    String
+  item      CaseItem @relation(fields: [itemId], references: [id])
+  cost      Int
+  value     Int
+  source    String   @default("SHOP") // SHOP | DAILY | BATTLE
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([caseId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Case battles
+// ---------------------------------------------------------------------------
+
+model CaseBattle {
+  id          String   @id @default(cuid())
+  caseId      String
+  case        Case     @relation(fields: [caseId], references: [id])
+  creatorId   String
+  creator     User     @relation("BattleCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  mode        String   // CLASSIC | TEAM | CRAZY
+  rounds      Int
+  slots       Int
+  entryCost   Int
+  prizePool   Int      @default(0)
+  status      String   @default("WAITING") // WAITING | RUNNING | FINISHED | CANCELLED
+  winnerId    String?
+  startsAt    DateTime?
+  createdAt   DateTime @default(now())
+  finishedAt  DateTime?
+
+  participants BattleParticipant[]
+  battleRounds BattleRound[]
+
+  @@index([status, createdAt])
+}
+
+model BattleParticipant {
+  id        String   @id @default(cuid())
+  battleId  String
+  battle    CaseBattle @relation(fields: [battleId], references: [id], onDelete: Cascade)
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  botName   String?
+  slot      Int
+  team      Int      @default(0)
+  total     Int      @default(0)
+  payout    Int      @default(0)
+  isWinner  Boolean  @default(false)
+  joinedAt  DateTime @default(now())
+
+  rounds    BattleRound[]
+
+  @@unique([battleId, slot])
+  @@index([userId])
+}
+
+model BattleRound {
+  id             String   @id @default(cuid())
+  battleId       String
+  battle         CaseBattle @relation(fields: [battleId], references: [id], onDelete: Cascade)
+  participantId  String
+  participant    BattleParticipant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+  roundNumber    Int
+  itemId         String
+  item           CaseItem @relation(fields: [itemId], references: [id])
+  value          Int
+
+  @@index([battleId, roundNumber])
+}
+
+// ---------------------------------------------------------------------------
+// Rewards & progression
+// ---------------------------------------------------------------------------
+
+model DailyReward {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount    Int
+  streak    Int      @default(1)
+  itemName  String?
+  rarity    String?
+  claimedAt DateTime @default(now())
+
+  @@index([userId, claimedAt])
+}
+
+model Achievement {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  title       String
+  description String
+  icon        String
+  category    String   @default("GENERAL")
+  target      Int      @default(1)
+  xpReward    Int      @default(0)
+  coinReward  Int      @default(0)
+  sortOrder   Int      @default(0)
+
+  unlocks     UserAchievement[]
+}
+
+model UserAchievement {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  achievementId String
+  achievement   Achievement @relation(fields: [achievementId], references: [id], onDelete: Cascade)
+  progress      Int      @default(0)
+  unlockedAt    DateTime?
+
+  @@unique([userId, achievementId])
+  @@index([userId])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      String   // INFO | SUCCESS | WARNING | REWARD | ACHIEVEMENT
+  title     String
+  body      String?
+  href      String?
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+// Public, sanitised feed. Never references a transaction or balance.
+model ActivityEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      String   // GAME_WIN | CASE_OPEN | BATTLE_WIN | LEVEL_UP | ACHIEVEMENT
+  label     String
+  amount    Int?
+  rarity    String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Operations
+// ---------------------------------------------------------------------------
+
+model AdminAuditLog {
+  id         String   @id @default(cuid())
+  actorId    String
+  actor      User     @relation("AuditActor", fields: [actorId], references: [id])
+  targetId   String?
+  target     User?    @relation("AuditTarget", fields: [targetId], references: [id])
+  action     String
+  summary    String
+  metadata   String?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([actorId])
+}
+
+model ServerStatusCache {
+  id            String   @id @default(cuid())
+  host          String   @unique
+  edition       String   // JAVA | BEDROCK
+  online        Boolean  @default(false)
+  playersOnline Int?
+  playersMax    Int?
+  version       String?
+  motd          String?
+  lastError     String?
+  fetchedAt     DateTime @default(now())
+}
